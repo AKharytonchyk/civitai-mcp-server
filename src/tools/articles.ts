@@ -80,7 +80,9 @@ export const articleTools: ToolModule = (reg) => {
         includeDrafts: z
           .boolean()
           .optional()
-          .describe('Include your own unpublished articles (ignored for other authors)'),
+          .describe(
+            'MODERATORS ONLY: include unpublished articles. Upstream ignores it for everyone else, so it does not list your own drafts.'
+          ),
       },
       annotations: { readOnlyHint: true },
     },
