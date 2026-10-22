@@ -116,6 +116,86 @@ async function fetchAllComments(
   return { comments: all };
 }
 
+/** A row from the legacy comment router, which serves model discussions. */
+interface LegacyCommentRow extends CommentRow {
+  tosViolation?: boolean;
+  _count?: { comments?: number };
+}
+
+/**
+ * Model discussions live in the legacy comment router (comment.getAll by
+ * modelId), not commentv2: a model's v2 Thread is missing or empty. Pinned rows
+ * come first on the first page, as the site returns them.
+ */
+async function fetchModelComments(
+  services: Services,
+  modelId: number,
+  limit: number,
+  sort: string,
+  budget: { remaining: number; truncated: boolean }
+): Promise<LegacyCommentRow[]> {
+  const all: LegacyCommentRow[] = [];
+  // The site orders by createdAt alone and dedupes by id across pages; so do we.
+  const seen = new Set<number>();
+  let cursor: number | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    if (budget.remaining <= 0) {
+      budget.truncated = true;
+      return all;
+    }
+    const input: Record<string, unknown> = { modelId, limit, sort: sort.toLowerCase() };
+    if (cursor !== undefined) input.cursor = cursor;
+    const res = await services.trpc.call<{ comments?: LegacyCommentRow[]; nextCursor?: number | null } | null>(
+      'comment.getAll',
+      input,
+      'GET'
+    );
+    for (const c of res?.comments ?? []) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      if (budget.remaining <= 0) {
+        budget.truncated = true;
+        return all;
+      }
+      all.push(c);
+      budget.remaining--;
+    }
+    cursor = toNumericCursor(res?.nextCursor);
+    if (cursor === undefined) return all;
+  }
+  budget.truncated = true;
+  return all;
+}
+
+/**
+ * Replies to a legacy comment, minus ToS violations. Null when the site refuses
+ * them: it checks the model (published, unlocked) for replies but not for the
+ * top-level list, so one refusal must not fail the whole listing.
+ */
+async function fetchModelReplies(
+  services: Services,
+  commentId: number,
+  budget: { remaining: number; truncated: boolean }
+): Promise<LegacyCommentRow[] | null> {
+  let res: LegacyCommentRow[] | null;
+  try {
+    res = await services.trpc.call<LegacyCommentRow[] | null>('comment.getCommentsById', { id: commentId }, 'GET');
+  } catch {
+    return null;
+  }
+  const replies: LegacyCommentRow[] = [];
+  for (const r of res ?? []) {
+    if (r.tosViolation) continue;
+    if (budget.remaining <= 0) {
+      budget.truncated = true;
+      break;
+    }
+    replies.push(r);
+    budget.remaining--;
+  }
+  return replies;
+}
+
 /** Coerce a cursor (the API returns a number, but be defensive) to a number. */
 function toNumericCursor(v: number | string | null | undefined): number | undefined {
   if (v === undefined || v === null) return undefined;
@@ -129,7 +209,7 @@ export const commentTools: ToolModule = (reg) => {
     {
       title: 'List comments',
       description:
-        'List comments on an entity (article, image, post, model, etc). Follows pagination so whole threads are returned (not just the first page). Recurses into replies up to `depth` levels (replies are comments whose parent entity is comment:<parentId>). To bound the worst-case fan-out, a single call fetches at most 500 comments total; when that ceiling is hit the result is marked truncated. Bodies truncated to 280 chars unless includeFull. Shows aggregated reactions, pin/hidden flags.',
+        'List comments on an entity (article, image, post, model, etc). Follows pagination so whole threads are returned (not just the first page). Recurses into replies up to `depth` levels (replies are comments whose parent entity is comment:<parentId>); a model discussion has one reply level. To bound the worst-case fan-out, a single call fetches at most 500 comments total; when that ceiling is hit the result is marked truncated. Bodies truncated to 280 chars unless includeFull. Shows aggregated reactions, pin/hidden flags.',
       inputSchema: {
         entityType: z.enum(ENTITY_TYPES).describe('Entity type the comments belong to'),
         entityId: z.number().int().describe('Entity ID'),
@@ -160,13 +240,36 @@ export const commentTools: ToolModule = (reg) => {
         }
         return comments.length;
       };
-      const top = await collect(args.entityType, args.entityId, 0, '');
+      const collectModel = async (): Promise<number> => {
+        const comments = await fetchModelComments(services, args.entityId, args.limit, args.sort, budget);
+        for (const c of comments) {
+          lines.push(formatComment(c, '', cap));
+          if (args.depth > 0 && (c._count?.comments ?? 0) > 0) {
+            if (budget.remaining <= 0) {
+              budget.truncated = true;
+              continue;
+            }
+            const replies = await fetchModelReplies(services, c.id, budget);
+            if (replies === null) {
+              lines.push(`  ↳ replies unavailable`);
+            } else if (replies.length) {
+              lines.push(`  ↳ ${replies.length} repl${replies.length === 1 ? 'y' : 'ies'}:`);
+              for (const r of replies) lines.push(formatComment(r, '    ', cap));
+            }
+          }
+        }
+        return comments.length;
+      };
+      const top =
+        args.entityType === 'model' ? await collectModel() : await collect(args.entityType, args.entityId, 0, '');
       const truncationNote = budget.truncated
         ? `\n\n[results truncated at ${MAX_COMMENTS_PER_CALL} comments — narrow entityId or reduce depth to see more]`
         : '';
       const footer = args.includeFull
         ? ''
-        : '\n\nBodies truncated to 280 chars. Use includeFull or get_comment for full text.';
+        : args.entityType === 'model'
+          ? '\n\nBodies truncated to 280 chars. Use includeFull for full text.'
+          : '\n\nBodies truncated to 280 chars. Use includeFull or get_comment for full text.';
       return ok(
         (lines.join('\n\n') || 'No comments.') +
           `\n\n(${top} top-level, depth=${args.depth})` +
