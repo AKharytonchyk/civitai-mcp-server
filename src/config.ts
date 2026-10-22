@@ -5,12 +5,13 @@ import { z } from 'zod';
  *
  * CIVITAI_API_URL is the base for BOTH the REST (/api/v1) and tRPC (/api/trpc)
  * clients. In-cluster this is overridden to e.g. http://civitai-app:3000 so the
- * server talks to the internal service instead of public civitai.com.
+ * server talks to the internal service instead of the public site.
  *
  * CIVITAI_WEB_URL is the SEPARATE public website base used to build user-facing
  * links in tool output (post/model/image/article URLs). It must stay public even
  * when apiUrl points at an internal cluster service — otherwise tools would hand
- * users un-clickable in-cluster URLs. Default https://civitai.com.
+ * users un-clickable in-cluster URLs. apiUrl defaults to https://civitai.red;
+ * webUrl defaults to apiUrl when that is a public civitai site, else civitai.com.
  */
 const TransportEnum = z.enum(['http', 'stdio']);
 
@@ -30,18 +31,18 @@ const ConfigSchema = z.object({
   apiUrl: z
     .string()
     .url()
-    .default('https://civitai.com')
+    .default('https://civitai.red')
     .transform((u) => u.replace(/\/+$/, '')),
   /**
    * Public website base for user-facing links in tool output (post/model/image/
    * profile URLs). Distinct from apiUrl: apiUrl may be an internal cluster service,
-   * but links handed to users must point at the public site. Default civitai.com.
+   * but links handed to users must point at the public site. Unset: see withWebUrl.
    */
   webUrl: z
     .string()
     .url()
-    .default('https://civitai.com')
-    .transform((u) => u.replace(/\/+$/, '')),
+    .optional()
+    .transform((u) => (u ? u.replace(/\/+$/, '') : u)),
   apiKey: z.string().min(1).optional(),
   transport: TransportEnum.default('http'),
   port: z.coerce.number().int().positive().default(3100),
@@ -77,16 +78,35 @@ const ConfigSchema = z.object({
     .union([z.boolean(), z.string()])
     .default(false)
     .transform((v) => v === true || v === 'true' || v === '1'),
+  /**
+   * Send the caller's own browsing level on searches. Default OFF: no level is
+   * sent for anyone. Requires a Cloudflare-fronted deployment; see deploy notes.
+   */
+  forwardUserBrowsingLevel: z
+    .union([z.boolean(), z.string()])
+    .default(false)
+    .transform((v) => v === true || v === 'true' || v === '1'),
 });
 
-export type Config = z.infer<typeof ConfigSchema>;
+const PUBLIC_SITES = new Set(['civitai.com', 'civitai.red']);
+const FALLBACK_WEB_URL = 'https://civitai.com';
+
+/** An unset webUrl follows apiUrl when that is a public civitai site, else civitai.com. */
+function withWebUrl(c: z.infer<typeof ConfigSchema>): Config {
+  if (c.webUrl) return { ...c, webUrl: c.webUrl };
+  const api = new URL(c.apiUrl);
+  const isPublicSite = api.protocol === 'https:' && PUBLIC_SITES.has(api.hostname);
+  return { ...c, webUrl: isPublicSite ? api.origin : FALLBACK_WEB_URL };
+}
+
+export type Config = z.infer<typeof ConfigSchema> & { webUrl: string };
 
 /**
  * Build a Config from a raw env-like record. Exported (rather than reading
  * process.env directly) so tests can exercise parsing without mutating globals.
  */
 export function parseConfig(env: Record<string, string | undefined>): Config {
-  return ConfigSchema.parse({
+  return withWebUrl(ConfigSchema.parse({
     apiUrl: env.CIVITAI_API_URL,
     webUrl: env.CIVITAI_WEB_URL,
     apiKey: env.CIVITAI_API_KEY,
@@ -98,7 +118,8 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     mcpAllowedHosts: csvList(env.MCP_ALLOWED_HOSTS),
     publicBaseUrl: env.PUBLIC_BASE_URL,
     oauthEnabled: env.OAUTH_ENABLED,
-  });
+    forwardUserBrowsingLevel: env.FORWARD_USER_BROWSING_LEVEL,
+  }));
 }
 
 let cached: Config | null = null;
