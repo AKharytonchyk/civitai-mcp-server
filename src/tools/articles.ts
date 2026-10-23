@@ -3,7 +3,6 @@ import type { ToolModule } from '../server.js';
 import { ok } from './helpers.js';
 import { mdToHtml } from '../lib/markdown.js';
 import { uploadImage } from './images.js';
-import type { MetaValues } from '../client/trpc.js';
 
 const NSFW_MAP: Record<string, number> = { PG: 1, PG13: 2, R: 4, X: 8, XXX: 16, Blocked: 32 };
 
@@ -42,9 +41,8 @@ interface ArticleRow {
     meta?: unknown;
     type?: string;
   } | null;
-  tags?: Array<{ id?: number; name: string }>;
-  attachments?: unknown[];
-  lockedProperties?: string[];
+  /** isCategory is derived by getById (the tag is linked from the article category system tag). */
+  tags?: Array<{ id?: number; name: string; isCategory?: boolean }>;
 }
 
 export const articleTools: ToolModule = (reg) => {
@@ -57,9 +55,10 @@ export const articleTools: ToolModule = (reg) => {
         'CONTENT FORMAT: contentFormat="markdown" (default) converts Markdown to HTML; ' +
         'contentFormat="html" sends your HTML through untouched, which is the only way to write ' +
         '<edge-media> images, and is required when round-tripping a body fetched from get_article. ' +
-        'UPDATES ARE MERGES: article.upsert overwrites every field it receives and clears every field ' +
-        'it does not, so when id is passed this tool first fetches the article and preserves status, ' +
-        'publishedAt, cover, tags and nsfw level unless you explicitly override them. ' +
+        'UPDATES KEEP WHAT YOU DO NOT PASS: article.upsert deletes the cover and resets the rating to PG when ' +
+        'they are omitted, so when id is passed this tool first fetches the article and re-sends its cover and ' +
+        'rating. Status and tags are left as they are unless you pass them; a tags list replaces the tags but ' +
+        'keeps the article\'s category. ' +
         'Optionally attach a cover by UUID (coverImageUuid) or by URL (coverImageUrl, uploaded automatically).',
       inputSchema: {
         title: z.string().describe('Article title'),
@@ -80,7 +79,10 @@ export const articleTools: ToolModule = (reg) => {
         tags: z
           .array(z.string())
           .optional()
-          .describe('Tag names (lowercased). On update, omit to keep the current tags; pass [] to clear them.'),
+          .describe(
+            'Tag names (lowercased). On update, omit to keep the current tags; a list replaces them ([] clears ' +
+              'them), except the category tag, which is kept.'
+          ),
         coverImageUuid: z.string().optional().describe('Cover image UUID from upload_image'),
         coverImageUrl: z.string().url().optional().describe('Cover image URL (uploaded automatically)'),
         coverWidth: z.number().int().optional().describe('Cover width (when using a UUID)'),
@@ -107,9 +109,9 @@ export const articleTools: ToolModule = (reg) => {
       const html = asHtml ? args.content : mdToHtml(args.content);
       if (!html || html === '<p></p>') throw new Error('Converted HTML content is empty');
 
-      // article.upsert is a full replace, not a patch: any field omitted from the
-      // payload is cleared. On update, start from the live record so an unrelated
-      // edit cannot null the cover, drop the tags or unpublish the article.
+      // article.upsert keeps whatever is omitted EXCEPT the cover (an omitted
+      // coverImage deletes the old cover image) and userNsfwLevel (defaults to PG).
+      // So on update, read the live record and re-send exactly those two.
       let current: ArticleRow | null = null;
       if (args.id) {
         current = await services.trpc.call<ArticleRow | null>('article.getById', { id: args.id }, 'GET');
@@ -128,9 +130,11 @@ export const articleTools: ToolModule = (reg) => {
         coverH = coverH ?? up.height;
       }
 
-      let coverImage: Record<string, unknown> | null;
+      const input: Record<string, unknown> = { title: args.title, content: html };
+      if (args.id) input.id = args.id;
+
       if (coverUuid) {
-        coverImage = {
+        input.coverImage = {
           url: coverUuid,
           width: coverW ?? 1024,
           height: coverH ?? 576,
@@ -140,8 +144,7 @@ export const articleTools: ToolModule = (reg) => {
           type: 'image',
         };
       } else if (current?.coverImage) {
-        // Preserve the existing cover verbatim rather than nulling it.
-        coverImage = {
+        input.coverImage = {
           id: current.coverImage.id,
           url: current.coverImage.url,
           width: current.coverImage.width,
@@ -151,53 +154,42 @@ export const articleTools: ToolModule = (reg) => {
           meta: current.coverImage.meta ?? null,
           type: current.coverImage.type ?? 'image',
         };
-      } else {
-        coverImage = null;
       }
 
-      const status = args.status ?? current?.status ?? 'Draft';
-      const nsfwLevel =
-        args.nsfwLevel !== undefined
-          ? (NSFW_MAP[args.nsfwLevel] ?? 1)
-          : (current?.userNsfwLevel ?? 1);
-      const tags =
-        args.tags !== undefined
-          ? args.tags.map((name) => ({ name: name.toLowerCase() }))
-          : (current?.tags ?? []).map((t) => ({ id: t.id, name: t.name }));
+      // A stored 0 means "never set"; the schema has no level 0 and rejects the whole save.
+      input.userNsfwLevel =
+        args.nsfwLevel !== undefined ? (NSFW_MAP[args.nsfwLevel] ?? 1) : current?.userNsfwLevel || 1;
 
-      const input: Record<string, unknown> = {
-        title: args.title,
-        content: html,
-        coverImage,
-        tags,
-        userNsfwLevel: nsfwLevel,
-        status,
-      };
-      if (args.id) input.id = args.id;
-      if (current?.attachments) input.attachments = current.attachments;
-      if (current?.lockedProperties) input.lockedProperties = current.lockedProperties;
+      // Omitted status is left alone. Re-sending a stored "Published" would run the
+      // publish-time image scan check and refuse edits the site itself allows.
+      const status = args.status ?? (args.id ? undefined : 'Draft');
+      if (status) input.status = status;
 
-      // publishedAt is z.date() server-side: without the superjson hint it fails to
-      // deserialize and a published article silently loses its publish date.
-      const metaValues: MetaValues = {};
-      if (current?.publishedAt) {
-        input.publishedAt = current.publishedAt;
-        metaValues.publishedAt = ['Date'];
+      if (args.tags !== undefined) {
+        const names = args.tags.map((name) => name.toLowerCase());
+        // A tags list replaces the whole set, and the category is just one of those
+        // tags: dropping it silently de-categorises the article, so keep it.
+        const category = (current?.tags ?? []).filter((t) => t.isCategory && !names.includes(t.name));
+        input.tags = [...category.map((t) => ({ id: t.id, name: t.name })), ...names.map((name) => ({ name }))];
       }
 
-      const result = await services.trpc.call<{ id?: number } | number>(
-        'article.upsert',
-        input,
-        'POST',
-        Object.keys(metaValues).length > 0 ? metaValues : undefined
-      );
+      const result = await services.trpc.call<{ id?: number } | number>('article.upsert', input);
       const id = typeof result === 'number' ? result : result?.id;
+      const statusNote = status ? `as ${status}` : `(status unchanged: ${current?.status ?? 'unknown'})`;
       return ok(
-        `Article ${args.id ? 'updated' : 'created'} as ${status}` +
+        `Article ${args.id ? 'updated' : 'created'} ${statusNote}` +
           ` (content sent as ${asHtml ? 'html' : 'markdown'}).` +
-          (args.id ? `\nPreserved: status, publishedAt, cover and tags not explicitly overridden.` : '') +
+          (args.id
+            ? `\nKept: cover and rating unless overridden; tags ${args.tags ? 'replaced, category kept' : 'untouched'}.`
+            : '') +
           (id ? `\nID: ${id}\nView: ${services.config.webUrl}/articles/${id}` : ''),
-        { ok: true, id, status, contentFormat: asHtml ? 'html' : 'markdown', coverImageUuid: coverUuid }
+        {
+          ok: true,
+          id,
+          status: status ?? current?.status ?? null,
+          contentFormat: asHtml ? 'html' : 'markdown',
+          coverImageUuid: coverUuid,
+        }
       );
     }
   );

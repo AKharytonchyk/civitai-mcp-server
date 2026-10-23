@@ -10,10 +10,13 @@ import { articleTools, looksLikeHtmlBody } from '../src/tools/articles.js';
  * destroyed part of a live article:
  *   1. HTML content was run through the Markdown converter, which escapes every
  *      `<` — images and code blocks became visible tag soup.
- *   2. article.upsert is a full replace, but the tool sent a partial payload, so
- *      an edit nulled the cover, dropped every tag and cleared publishedAt.
- *   3. publishedAt was sent without the superjson Date hint, so it never
- *      deserialized server-side.
+ *   2. Every edit sent coverImage: null (which deletes the cover image), tags: []
+ *      (clears them), userNsfwLevel: PG and status: Draft (unpublishes).
+ *   3. Re-sending the whole stored record instead is wrong too: a stored
+ *      "Published" re-runs the publish-time image scan check, and publishedAt,
+ *      attachments and lockedProperties are ignored or dropped server-side.
+ * The fix sends what the caller passed plus the two fields article.upsert
+ * destroys when omitted: the cover and the nsfw level.
  */
 type Handler = (args: Record<string, unknown>, services: Services) => Promise<ToolResult>;
 
@@ -65,6 +68,12 @@ const LIVE = {
   tags: [{ id: 6294, name: 'original character' }, { id: 157378, name: 'index' }],
   attachments: [],
   lockedProperties: [],
+};
+
+/** LIVE with a category: getById flags the tag linked from the article category system tag. */
+const CATEGORIZED = {
+  ...LIVE,
+  tags: [{ id: 5133, name: 'guide', isCategory: true }, { id: 6294, name: 'original character', isCategory: false }],
 };
 
 afterEach(() => vi.restoreAllMocks());
@@ -134,17 +143,18 @@ describe('upsert_article content format', () => {
 });
 
 describe('upsert_article preserves the rest of the article on update', () => {
-  async function updateOnly() {
+  async function update(extra: Record<string, unknown> = {}, live: unknown = LIVE) {
     const { schema, handler } = collect(articleTools).get('upsert_article')!;
     const svc = services();
-    const calls = stubTrpc(svc, (p) => (p === 'article.getById' ? LIVE : { id: 33326 }));
-    await handler(
-      parse(schema, { id: 33326, title: LIVE.title, content: '<p>New body.</p>', contentFormat: 'html' }),
+    const calls = stubTrpc(svc, (p) => (p === 'article.getById' ? live : { id: 33326 }));
+    const res = await handler(
+      parse(schema, { id: 33326, title: LIVE.title, content: '<p>New body.</p>', contentFormat: 'html', ...extra }),
       svc
     );
     const upsert = calls.find((c) => c.procedure === 'article.upsert')!;
-    return { input: upsert.input as Record<string, unknown>, meta: upsert.meta, calls };
+    return { input: upsert.input as Record<string, unknown>, meta: upsert.meta, calls, res };
   }
+  const updateOnly = () => update();
 
   it('fetches the live record before writing', async () => {
     const { calls } = await updateOnly();
@@ -162,24 +172,52 @@ describe('upsert_article preserves the rest of the article on update', () => {
     });
   });
 
-  it('keeps the tags instead of clearing them', async () => {
+  it('leaves the tags out, which the server reads as "keep them"', async () => {
     const { input } = await updateOnly();
-    expect(input.tags).toEqual([
-      { id: 6294, name: 'original character' },
-      { id: 157378, name: 'index' },
-    ]);
+    expect(input).not.toHaveProperty('tags');
   });
 
-  it('keeps status and nsfw level', async () => {
+  it('keeps the nsfw level, which the server would reset to PG', async () => {
     const { input } = await updateOnly();
-    expect(input.status).toBe('Published');
     expect(input.userNsfwLevel).toBe(2);
   });
 
-  it('keeps publishedAt AND sends the superjson Date hint', async () => {
+  it('sends a stored level 0 as PG: the schema has no 0 and would refuse the save', async () => {
+    const { input } = await update({}, { ...LIVE, userNsfwLevel: 0 });
+    expect(input.userNsfwLevel).toBe(1);
+  });
+
+  it('leaves status out, so a published article is edited without re-publishing it', async () => {
+    const { input, res } = await updateOnly();
+    expect(input).not.toHaveProperty('status');
+    expect(res.content[0]!.text).toContain('status unchanged: Published');
+    expect(res.structuredContent).toMatchObject({ status: 'Published' });
+  });
+
+  it('sends only fields the server needs: no publishedAt, attachments or lockedProperties', async () => {
     const { input, meta } = await updateOnly();
-    expect(input.publishedAt).toBe('2026-08-01T13:55:06.331Z');
-    expect(meta).toEqual({ publishedAt: ['Date'] });
+    expect(Object.keys(input).sort()).toEqual(['content', 'coverImage', 'id', 'title', 'userNsfwLevel']);
+    expect(meta).toBeUndefined();
+  });
+
+  it('sends no coverImage at all when the article has none (null or {} would mean something)', async () => {
+    const { input } = await update({}, { ...LIVE, coverImage: null });
+    expect(input).not.toHaveProperty('coverImage');
+  });
+
+  it('a tags list replaces the tags but keeps the category', async () => {
+    const { input } = await update({ tags: ['Fresh'] }, CATEGORIZED);
+    expect(input.tags).toEqual([{ id: 5133, name: 'guide' }, { name: 'fresh' }]);
+  });
+
+  it('[] clears the tags except the category', async () => {
+    const { input } = await update({ tags: [] }, CATEGORIZED);
+    expect(input.tags).toEqual([{ id: 5133, name: 'guide' }]);
+  });
+
+  it('does not send the category twice when the caller names it', async () => {
+    const { input } = await update({ tags: ['Guide', 'fresh'] }, CATEGORIZED);
+    expect(input.tags).toEqual([{ name: 'guide' }, { name: 'fresh' }]);
   });
 
   it('honours explicit overrides', async () => {
@@ -202,6 +240,11 @@ describe('upsert_article preserves the rest of the article on update', () => {
     expect(input.userNsfwLevel).toBe(4);
   });
 
+  it('sends status when asked', async () => {
+    const { input } = await update({ status: 'Draft' });
+    expect(input.status).toBe('Draft');
+  });
+
   it('lets [] explicitly clear tags', async () => {
     const { schema, handler } = collect(articleTools).get('upsert_article')!;
     const svc = services();
@@ -222,6 +265,9 @@ describe('upsert_article preserves the rest of the article on update', () => {
     expect(calls.filter((c) => c.procedure === 'article.getById')).toHaveLength(0);
     const input = calls[0]!.input as Record<string, unknown>;
     expect(input.status).toBe('Draft');
+    expect(input.userNsfwLevel).toBe(1);
+    expect(input).not.toHaveProperty('coverImage');
+    expect(input).not.toHaveProperty('tags');
     expect(input.publishedAt).toBeUndefined();
     expect(calls[0]!.meta).toBeUndefined();
   });
