@@ -60,11 +60,24 @@ describe('get_my_resource_review', () => {
   it('reports the review when one exists, including the array shape', async () => {
     const tools = collect(engagementTools);
     const svc = services();
-    stubTrpc(svc, () => [{ id: 42, rating: 5, recommended: true, details: 'great' }]);
+    // Exactly resourceReviewSimpleSelect: there is no `rating` in this response.
+    stubTrpc(svc, () => [
+      {
+        id: 42,
+        modelId: 7,
+        modelVersionId: 1,
+        recommended: true,
+        details: 'great',
+        createdAt: '2026-09-01T00:00:00.000Z',
+        exclude: false,
+      },
+    ]);
 
     const t = tools.get('get_my_resource_review')!;
     const res = await t.handler(parse(t.schema, { modelVersionId: 1 }), svc);
 
-    expect(res.structuredContent).toMatchObject({ reviewed: true, id: 42, rating: 5 });
+    expect(res.structuredContent).toEqual({ reviewed: true, id: 42, recommended: true, details: 'great' });
+    // It used to print "undefined/5" for every review.
+    expect(res.content[0]!.text).not.toContain('undefined');
   });
 });

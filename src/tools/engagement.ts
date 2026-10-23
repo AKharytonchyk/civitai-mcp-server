@@ -115,7 +115,9 @@ export const engagementTools: ToolModule = (reg) => {
     'get_my_resource_review',
     {
       title: 'Get my review of a model version',
-      description: 'Fetch your existing review for a model version (resourceReview.getUserResourceReview), or null.',
+      description:
+        'Fetch your existing review for a model version (resourceReview.getUserResourceReview): id, recommended and ' +
+        'details, or reviewed:false. The star rating is not part of this response.',
       inputSchema: {
         modelVersionId: z.number().int().describe('Model version ID'),
       },
@@ -123,9 +125,10 @@ export const engagementTools: ToolModule = (reg) => {
     },
     async (args, services) => {
       services.auth.requireKey();
+      // resourceReviewSimpleSelect: id, modelId, modelVersionId, recommended,
+      // details, createdAt, exclude. No `rating` — that needs resourceReview.get.
       type Review = {
         id?: number;
-        rating?: number;
         recommended?: boolean;
         details?: string;
       };
@@ -142,11 +145,11 @@ export const engagementTools: ToolModule = (reg) => {
         return ok(`You have not reviewed model version ${args.modelVersionId}.`, { reviewed: false });
       }
       return ok(
-        `Your review of model version ${args.modelVersionId}: ${review.rating}/5, recommended=${review.recommended} (id ${review.id}).`,
+        `Your review of model version ${args.modelVersionId}: recommended=${review.recommended} (id ${review.id}). ` +
+          'This lookup does not return the star rating.',
         {
           reviewed: true,
           id: review.id,
-          rating: review.rating,
           recommended: review.recommended,
           details: review.details,
         }
