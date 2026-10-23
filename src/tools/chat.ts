@@ -24,6 +24,8 @@ interface ChatMember {
   userId?: number;
   user?: { id?: number; username?: string };
   isOwner?: boolean;
+  /** ChatMemberStatus: Invited | Joined | Ignored | Left | Kicked. */
+  status?: string;
 }
 interface ChatRow {
   id: number;
@@ -59,7 +61,11 @@ export const chatTools: ToolModule = (reg) => {
       const chats = Array.isArray(res) ? res : (res?.items ?? []);
       const lines = chats.map((c) => {
         const names = (c.chatMembers ?? [])
-          .map((m) => m.user?.username ?? `user#${m.userId ?? m.user?.id}`)
+          .map((m) => {
+            const name = m.user?.username ?? `user#${m.userId ?? m.user?.id}`;
+            // Members who left, were kicked or never joined are still listed by chat.getAllByUser.
+            return m.status && m.status !== 'Joined' ? `${name} (${m.status})` : name;
+          })
           .join(', ');
         return `Chat #${c.id}: ${names || '(no members)'}`;
       });
@@ -75,6 +81,7 @@ export const chatTools: ToolModule = (reg) => {
             userId: m.userId ?? m.user?.id ?? null,
             username: m.user?.username ?? null,
             isOwner: m.isOwner ?? null,
+            status: m.status ?? null,
           })),
         })),
       });
