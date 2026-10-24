@@ -43,7 +43,14 @@ export interface ModelVersionLite {
   trainedWords?: string[];
   /** civitai's own AIR for this version; /model-versions/:id sends it, /models does not. */
   air?: string;
-  files?: Array<{ name?: string; type?: string; primary?: boolean; sizeKB?: number; metadata?: { format?: string } }>;
+  files?: Array<{
+    name?: string;
+    type?: string;
+    primary?: boolean;
+    sizeKB?: number;
+    metadata?: { format?: string };
+    hashes?: Record<string, string>;
+  }>;
   stats?: { downloadCount?: number; thumbsUpCount?: number };
   images?: Array<{ url?: string; width?: number; height?: number }>;
 }
@@ -161,11 +168,16 @@ export function formatModelDetail(model: ModelLite, siteUrl: string): string {
   return lines.join('\n');
 }
 
+/** A GET /model-versions/:id response (the fields we read). */
+export type VersionDetailLite = ModelVersionLite & {
+  modelId?: number;
+  model?: { name?: string; type?: string };
+  status?: string;
+  description?: string;
+};
+
 /** Full model-version detail block. */
-export function formatVersionDetail(
-  v: ModelVersionLite & { modelId?: number; model?: { name?: string; type?: string }; status?: string; description?: string },
-  siteUrl: string
-): string {
+export function formatVersionDetail(v: VersionDetailLite, siteUrl: string): string {
   const lines = [
     `# ${v.model?.name ?? 'Unknown'} — ${v.name} (Version ID: ${v.id})`,
     `Model ID: ${v.modelId}  |  Type: ${v.model?.type ?? 'Unknown'}  |  Base: ${v.baseModel ?? 'Unknown'}`,
@@ -184,6 +196,30 @@ export function formatVersionDetail(
     }
   }
   return lines.join('\n');
+}
+
+/** What formatVersionDetail prints, as structuredContent, plus the file hashes. */
+export function versionDetail(v: VersionDetailLite) {
+  return {
+    id: v.id,
+    modelId: v.modelId,
+    name: v.name,
+    modelName: v.model?.name,
+    type: v.model?.type,
+    baseModel: v.baseModel,
+    status: v.status,
+    publishedAt: v.publishedAt,
+    air: versionAir(v, v.model?.type, v.modelId ?? 0),
+    trainedWords: v.trainedWords ?? [],
+    files: (v.files ?? []).map((f) => ({
+      name: f.name,
+      type: f.type,
+      primary: f.primary ?? false,
+      sizeKB: f.sizeKB,
+      format: f.metadata?.format,
+      hashes: f.hashes,
+    })),
+  };
 }
 
 export interface ImageLite {
